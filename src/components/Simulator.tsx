@@ -3,24 +3,24 @@
 import { useMemo, useState } from "react";
 
 type Currency = "ARS" | "USD";
-type PaymentType = "Contado" | "Cuotas";
+type PaymentType = "100% contado" | "Parte contado + parte financiado" | "100% financiado";
 type Status = "Riesgo alto" | "Ajustada" | "Sostenible";
-type DecisionType = "Compra personal" | "Inversión / oportunidad" | "Proyecto que puede generar ingresos";
+type DecisionType = "Compra o gasto importante" | "Inversión / crecimiento";
 
 type Inputs = {
   income: number;
   expenses: number;
   cash: number;
   currency: Currency;
-  months: number;
   investment: number;
+  hasNewExpense: boolean;
   newExpense: number;
+  hasNewIncome: boolean;
   newIncome: number;
-  incomeStartMonth: number;
-  expenseStartMonth: number;
   exitValue: number;
   exitMonth: number;
   paymentType: PaymentType;
+  downPayment: number;
   financedAmount: number;
   installments: number;
   offeredInstallment: number;
@@ -35,7 +35,7 @@ type MonthRow = {
   currentExpenses: number;
   newExpenses: number;
   financingPayment: number;
-  upfrontInvestment: number;
+  upfrontPayment: number;
   totalExpenses: number;
   monthlyResult: number;
   accumulatedCash: number;
@@ -49,7 +49,11 @@ type Calculation = {
   monthlyFlow: number;
   recoveryMonths: number | null;
   mostDemandingMonth: number;
-  capitalPaid: number;
+  upfrontPaid: number;
+  totalFinanced: number;
+  totalPaid: number;
+  financeCost: number;
+  financeCostPct: number;
   exitValue: number;
   investmentResult: number;
   status: Status;
@@ -68,15 +72,15 @@ const initialInputs: Inputs = {
   expenses: 0,
   cash: 0,
   currency: "ARS",
-  months: 12,
   investment: 0,
+  hasNewExpense: false,
   newExpense: 0,
+  hasNewIncome: false,
   newIncome: 0,
-  incomeStartMonth: 1,
-  expenseStartMonth: 1,
   exitValue: 0,
   exitMonth: 12,
-  paymentType: "Contado",
+  paymentType: "100% contado",
+  downPayment: 0,
   financedAmount: 0,
   installments: 12,
   offeredInstallment: 0
@@ -94,25 +98,16 @@ const decisionCards: Array<{
   type: DecisionType;
   title: string;
   examples: string;
-  available: boolean;
 }> = [
   {
-    type: "Compra personal",
-    title: "Compra personal",
-    examples: "Auto, moto, mudanza, gastos grandes.",
-    available: true
+    type: "Compra o gasto importante",
+    title: "Compra o gasto importante",
+    examples: "Auto, moto, mudanza, gastos grandes."
   },
   {
-    type: "Inversión / oportunidad",
-    title: "Inversión / oportunidad",
-    examples: "Terreno, auto para reventa, capital inmovilizado, oportunidad de compra y venta.",
-    available: true
-  },
-  {
-    type: "Proyecto que puede generar ingresos",
-    title: "Proyecto que puede generar ingresos",
-    examples: "Emprendimiento, networking, curso, herramienta de trabajo, membresía.",
-    available: false
+    type: "Inversión / crecimiento",
+    title: "Inversión / crecimiento",
+    examples: "Terreno, networking, negocio, compra/venta, herramientas, capital inmovilizado."
   }
 ];
 
@@ -124,17 +119,44 @@ function money(value: number, currency: Currency) {
   }).format(Number.isFinite(value) ? value : 0);
 }
 
-function clampMonth(value: number, max = 24) {
+function clampMonth(value: number, max = 120) {
   return Math.min(max, Math.max(1, Math.round(value || 1)));
 }
 
-function statusLabel(finalCash: number, investmentResult: number, minCash: number, recoveryMonths: number | null): Status {
+function getSimulationMonths(inputs: Inputs, isInvestment: boolean) {
+  if (isInvestment) {
+    return Math.max(12, inputs.exitMonth, inputs.paymentType === "100% contado" ? 0 : inputs.installments);
+  }
+  return inputs.paymentType === "100% contado" ? 12 : Math.max(1, inputs.installments);
+}
+
+function getPaymentSummary(inputs: Inputs) {
+  const hasFinancing = inputs.paymentType !== "100% contado";
+  const totalFinanced = hasFinancing ? inputs.financedAmount : 0;
+  const totalPaid = hasFinancing ? inputs.offeredInstallment * inputs.installments : 0;
+  const financeCost = totalPaid - totalFinanced;
+  const financeCostPct = totalFinanced > 0 ? financeCost / totalFinanced : 0;
+  const upfrontPaid =
+    inputs.paymentType === "100% contado"
+      ? inputs.investment
+      : inputs.paymentType === "Parte contado + parte financiado"
+        ? inputs.downPayment
+        : 0;
+
+  return { hasFinancing, totalFinanced, totalPaid, financeCost, financeCostPct, upfrontPaid };
+}
+
+function affordabilityStatus(finalCash: number, minCash: number): Status {
+  if (finalCash < 0 || minCash < 0) return "Riesgo alto";
+  if (minCash < Math.max(1, finalCash * 0.1)) return "Ajustada";
+  return "Sostenible";
+}
+
+function investmentStatus(finalCash: number, investmentResult: number, minCash: number, recoveryMonths: number | null): Status {
   if (finalCash < 0 || minCash < 0 || investmentResult < 0 || recoveryMonths === null) {
     return "Riesgo alto";
   }
-  const lowCash = minCash < Math.max(1, Math.abs(finalCash) * 0.1);
-  const slowRecovery = recoveryMonths > 12;
-  if (lowCash || slowRecovery) {
+  if (minCash < Math.max(1, Math.abs(finalCash) * 0.1) || recoveryMonths > 12) {
     return "Ajustada";
   }
   return "Sostenible";
@@ -149,29 +171,29 @@ function statusClasses(status: Status) {
 function buildProjection(inputs: Inputs, scenario: Scenario = {}, isInvestment = false): MonthRow[] {
   const rows: MonthRow[] = [];
   let cash = inputs.cash;
-  const upfrontInvestment =
-    inputs.paymentType === "Cuotas"
-      ? Math.max(inputs.investment - inputs.financedAmount, 0)
-      : inputs.investment;
-  const adjustedExpense = Math.max(0, inputs.newExpense * (1 + (scenario.costPct ?? 0)) + (scenario.expenseChange ?? 0));
-  const adjustedIncome = Math.max(0, inputs.newIncome + (scenario.incomeChange ?? 0));
+  const months = getSimulationMonths(inputs, isInvestment);
+  const payment = getPaymentSummary(inputs);
+  const adjustedExpense = (isInvestment || inputs.hasNewExpense)
+    ? Math.max(0, inputs.newExpense * (1 + (scenario.costPct ?? 0)) + (scenario.expenseChange ?? 0))
+    : 0;
+  const adjustedIncome = (isInvestment || inputs.hasNewIncome)
+    ? Math.max(0, inputs.newIncome + (scenario.incomeChange ?? 0))
+    : 0;
   const adjustedExitValue = Math.max(0, inputs.exitValue * (1 + (scenario.exitValuePct ?? 0)));
-  const exitMonth = clampMonth(inputs.exitMonth + (scenario.exitMonthDelta ?? 0), inputs.months);
+  const exitMonth = clampMonth(inputs.exitMonth + (scenario.exitMonthDelta ?? 0), months);
 
-  for (let month = 1; month <= inputs.months; month += 1) {
-    const newIncome =
-      month >= inputs.incomeStartMonth ? adjustedIncome : 0;
-    const newExpenses =
-      month >= (isInvestment ? 1 : inputs.expenseStartMonth) ? adjustedExpense : 0;
+  for (let month = 1; month <= months; month += 1) {
+    const newIncome = adjustedIncome;
+    const newExpenses = adjustedExpense;
     const exitIncome = isInvestment && month === exitMonth ? adjustedExitValue : 0;
     const financingPayment =
-      inputs.paymentType === "Cuotas" && month <= inputs.installments
+      payment.hasFinancing && month <= inputs.installments
         ? inputs.offeredInstallment
         : 0;
-    const investmentImpact = month === 1 ? upfrontInvestment : 0;
+    const upfrontPayment = month === 1 ? payment.upfrontPaid : 0;
     const totalIncome = inputs.income + newIncome + exitIncome;
     const totalExpenses =
-      inputs.expenses + newExpenses + financingPayment + investmentImpact;
+      inputs.expenses + newExpenses + financingPayment + upfrontPayment;
     const monthlyResult = totalIncome - totalExpenses;
     cash += monthlyResult;
 
@@ -184,7 +206,7 @@ function buildProjection(inputs: Inputs, scenario: Scenario = {}, isInvestment =
       currentExpenses: inputs.expenses,
       newExpenses,
       financingPayment,
-      upfrontInvestment: investmentImpact,
+      upfrontPayment,
       totalExpenses,
       monthlyResult,
       accumulatedCash: cash
@@ -200,24 +222,28 @@ function calculate(inputs: Inputs, scenario: Scenario = {}, isInvestment = false
   const minRow = rows.reduce((lowest, row) => row.accumulatedCash < lowest.accumulatedCash ? row : lowest, rows[0]);
   const minCash = minRow?.accumulatedCash ?? inputs.cash;
   const mostDemandingMonth = minRow?.month ?? 1;
-  const monthlyFlow =
-    (inputs.newIncome + (scenario.incomeChange ?? 0)) -
-    Math.max(0, inputs.newExpense * (1 + (scenario.costPct ?? 0)) + (scenario.expenseChange ?? 0)) -
-    (inputs.paymentType === "Cuotas" ? inputs.offeredInstallment : 0);
+  const payment = getPaymentSummary(inputs);
+  const adjustedExpense = (isInvestment || inputs.hasNewExpense)
+    ? Math.max(0, inputs.newExpense * (1 + (scenario.costPct ?? 0)) + (scenario.expenseChange ?? 0))
+    : 0;
+  const adjustedIncome = (isInvestment || inputs.hasNewIncome)
+    ? Math.max(0, inputs.newIncome + (scenario.incomeChange ?? 0))
+    : 0;
+  const monthlyFlow = adjustedIncome - adjustedExpense - (payment.hasFinancing ? inputs.offeredInstallment : 0);
   const adjustedExitValue = Math.max(0, inputs.exitValue * (1 + (scenario.exitValuePct ?? 0)));
   const generatedIncome = rows.reduce((acc, row) => acc + row.newIncome, 0);
   const carryingCosts = rows.reduce((acc, row) => acc + row.newExpenses, 0);
   const financingPaid = rows.reduce((acc, row) => acc + row.financingPayment, 0);
-  const capitalPaid = rows.reduce((acc, row) => acc + row.upfrontInvestment, 0) + financingPaid;
+  const upfrontPaid = rows.reduce((acc, row) => acc + row.upfrontPayment, 0);
   const investmentResult = isInvestment
-    ? generatedIncome + adjustedExitValue - carryingCosts - capitalPaid
+    ? generatedIncome + adjustedExitValue - carryingCosts - upfrontPaid - financingPaid
     : rows.reduce((acc, row) => acc + row.monthlyResult, 0);
-  const recoveryMonths = investmentResult >= 0
-    ? clampMonth(inputs.exitMonth + (scenario.exitMonthDelta ?? 0), inputs.months)
-    : monthlyFlow > 0
-      ? Math.ceil(inputs.investment / monthlyFlow)
-      : null;
-  const status = statusLabel(finalCash, investmentResult, minCash, recoveryMonths);
+  const recoveryMonths = isInvestment && investmentResult >= 0
+    ? clampMonth(inputs.exitMonth + (scenario.exitMonthDelta ?? 0), getSimulationMonths(inputs, isInvestment))
+    : null;
+  const status = isInvestment
+    ? investmentStatus(finalCash, investmentResult, minCash, recoveryMonths)
+    : affordabilityStatus(finalCash, minCash);
 
   return {
     rows,
@@ -227,7 +253,11 @@ function calculate(inputs: Inputs, scenario: Scenario = {}, isInvestment = false
     monthlyFlow,
     recoveryMonths,
     mostDemandingMonth,
-    capitalPaid,
+    upfrontPaid,
+    totalFinanced: payment.totalFinanced,
+    totalPaid: payment.totalPaid,
+    financeCost: payment.financeCost,
+    financeCostPct: payment.financeCostPct,
     exitValue: adjustedExitValue,
     investmentResult,
     status
@@ -294,16 +324,48 @@ function SelectField<T extends string>({
   );
 }
 
+function ToggleField({
+  label,
+  value,
+  onChange
+}: {
+  label: string;
+  value: boolean;
+  onChange: (value: boolean) => void;
+}) {
+  return (
+    <div className="grid gap-2">
+      <span className="text-sm font-semibold text-[#28322f]">{label}</span>
+      <div className="grid grid-cols-2 gap-2 rounded-lg border border-[#d9d3c7] bg-white p-1">
+        {[true, false].map((option) => (
+          <button
+            key={String(option)}
+            className={`h-10 rounded-md text-sm font-semibold transition ${
+              value === option ? "bg-[#2f6f63] text-white" : "text-[#6d766f] hover:bg-[#f6f2ea]"
+            }`}
+            onClick={() => onChange(option)}
+            type="button"
+          >
+            {option ? "Sí" : "No"}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function MetricCard({
   label,
   value,
   helper,
-  tone = "neutral"
+  tone = "neutral",
+  compact = false
 }: {
   label: string;
   value: string;
   helper?: string;
   tone?: "neutral" | "success" | "warning" | "danger";
+  compact?: boolean;
 }) {
   const toneClass = {
     neutral: "border-[#d9d3c7] bg-[#fffdf8]",
@@ -313,18 +375,18 @@ function MetricCard({
   }[tone];
 
   return (
-    <div className={`rounded-lg border p-4 ${toneClass}`}>
+    <div className={`rounded-lg border ${compact ? "p-3" : "p-4"} ${toneClass}`}>
       <p className="text-xs font-semibold uppercase tracking-wide text-[#6d766f]">{label}</p>
-      <p className="mt-2 break-words text-xl font-semibold text-[#28322f]">{value}</p>
+      <p className={`${compact ? "mt-1 text-lg" : "mt-2 text-xl"} break-words font-semibold text-[#28322f]`}>{value}</p>
       {helper ? <p className="mt-2 text-sm leading-relaxed text-[#6d766f]">{helper}</p> : null}
     </div>
   );
 }
 
-function CashChart({ rows, currency }: { rows: MonthRow[]; currency: Currency }) {
+function CashChart({ rows, currency, compact = false }: { rows: MonthRow[]; currency: Currency; compact?: boolean }) {
   const width = 720;
-  const height = 240;
-  const padding = 34;
+  const height = compact ? 170 : 240;
+  const padding = 30;
   const values = rows.map((row) => row.accumulatedCash);
   const min = Math.min(0, ...values);
   const max = Math.max(1, ...values);
@@ -338,16 +400,16 @@ function CashChart({ rows, currency }: { rows: MonthRow[]; currency: Currency })
 
   return (
     <div className="rounded-lg border border-[#d9d3c7] bg-white p-4">
-      <div className="mb-3 flex items-center justify-between gap-3">
+      <div className="mb-2 flex items-center justify-between gap-3">
         <h3 className="text-base font-semibold text-[#28322f]">Caja acumulada mes a mes</h3>
         <span className="text-sm text-[#6d766f]">{currency}</span>
       </div>
       <svg className="h-auto w-full" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Evolución de caja acumulada">
         <line x1={padding} x2={width - padding} y1={zeroY} y2={zeroY} stroke="#d9d3c7" strokeDasharray="5 5" />
-        <polyline fill="none" points={points.join(" ")} stroke="#2f6f63" strokeLinecap="round" strokeLinejoin="round" strokeWidth="4" />
+        <polyline fill="none" points={points.join(" ")} stroke="#2f6f63" strokeLinecap="round" strokeLinejoin="round" strokeWidth={compact ? "3" : "4"} />
         {values.map((value, index) => {
           const [x, y] = points[index].split(",").map(Number);
-          return <circle key={`${index}-${value}`} cx={x} cy={y} fill="#e7b85d" r="4" />;
+          return <circle key={`${index}-${value}`} cx={x} cy={y} fill="#e7b85d" r={compact ? "3" : "4"} />;
         })}
       </svg>
       <div className="mt-2 flex justify-between text-xs text-[#6d766f]">
@@ -359,21 +421,36 @@ function CashChart({ rows, currency }: { rows: MonthRow[]; currency: Currency })
   );
 }
 
+function FinanceSummary({ results, currency }: { results: Calculation; currency: Currency }) {
+  return (
+    <div className="grid gap-4 md:grid-cols-3">
+      <MetricCard label="Total pagado" value={money(results.totalPaid, currency)} tone={results.totalPaid > 0 ? "warning" : "neutral"} />
+      <MetricCard
+        label="Diferencia vs financiado"
+        value={money(results.financeCost, currency)}
+        helper={`${(results.financeCostPct * 100).toFixed(1)}% sobre el monto financiado.`}
+      />
+      <MetricCard label="Total financiado" value={money(results.totalFinanced, currency)} />
+    </div>
+  );
+}
+
 export function Simulator() {
   const [step, setStep] = useState(0);
   const [decisionType, setDecisionType] = useState<DecisionType | null>(null);
-  const [showComingSoon, setShowComingSoon] = useState(false);
   const [inputs, setInputs] = useState<Inputs>(initialInputs);
   const [customExitValuePct, setCustomExitValuePct] = useState(0);
   const [customCostPct, setCustomCostPct] = useState(0);
   const [customExitMonthDelta, setCustomExitMonthDelta] = useState(0);
   const [customIncome, setCustomIncome] = useState(0);
   const [customExpense, setCustomExpense] = useState(0);
-  const isInvestment = decisionType === "Inversión / oportunidad";
+  const isInvestment = decisionType === "Inversión / crecimiento";
+  const isPurchase = decisionType === "Compra o gasto importante" || decisionType === null;
+  const hasFinancing = inputs.paymentType !== "100% contado";
 
   const results = useMemo(() => calculate(inputs, {}, isInvestment), [inputs, isInvestment]);
   const difficult = useMemo(
-    () => calculate(inputs, isInvestment ? { exitValuePct: -0.2, costPct: 0.1, exitMonthDelta: inputs.exitMonth + 2 <= inputs.months ? 2 : 0 } : { incomeChange: inputs.newIncome * -0.2, expenseChange: inputs.newExpense * 0.1 }, isInvestment),
+    () => calculate(inputs, isInvestment ? { exitValuePct: -0.2, costPct: 0.1, exitMonthDelta: inputs.exitMonth + 2 <= getSimulationMonths(inputs, true) ? 2 : 0 } : { incomeChange: inputs.newIncome * -0.2, expenseChange: inputs.newExpense * 0.1 }, isInvestment),
     [inputs, isInvestment]
   );
   const favorable = useMemo(
@@ -385,22 +462,13 @@ export function Simulator() {
     [inputs, isInvestment, customExitValuePct, customCostPct, customExitMonthDelta, customIncome, customExpense]
   );
 
-  const totalFinanced = inputs.paymentType === "Cuotas" ? inputs.financedAmount : 0;
-  const totalPaid =
-    inputs.paymentType === "Cuotas" ? inputs.offeredInstallment * inputs.installments : 0;
-  const financeCost = totalPaid - totalFinanced;
-  const financeCostPct = totalFinanced > 0 ? financeCost / totalFinanced : 0;
-
   function update<K extends keyof Inputs>(key: K, value: Inputs[K]) {
     setInputs((current) => ({ ...current, [key]: value }));
   }
 
-  function chooseDecision(type: DecisionType, available: boolean) {
+  function chooseDecision(type: DecisionType) {
     setDecisionType(type);
-    setShowComingSoon(!available);
-    if (available) {
-      setStep(1);
-    }
+    setStep(1);
   }
 
   function next() {
@@ -451,40 +519,35 @@ export function Simulator() {
                   Simulador guiado
                 </p>
                 <h2 className="text-3xl font-semibold leading-tight text-[#28322f] sm:text-5xl">
-                  ¿Qué querés analizar?
+                  ¿Qué decisión querés simular?
                 </h2>
                 <p className="mt-4 text-base leading-relaxed text-[#6d766f] sm:text-lg">
-                  Un solo motor financiero, con textos y escenarios adaptados al tipo de decisión.
+                  Simulá el impacto financiero de una decisión antes de tomarla.
                 </p>
               </div>
-              <div className="grid gap-4 lg:grid-cols-3">
+              <div className="grid gap-4 md:grid-cols-2">
                 {decisionCards.map((card) => {
                   const selected = decisionType === card.type;
                   return (
                     <button
                       key={card.type}
-                      className={`grid min-h-[190px] content-between rounded-lg border p-5 text-left transition hover:border-[#2f6f63] ${
+                      className={`grid min-h-[170px] content-between rounded-lg border p-5 text-left transition hover:border-[#2f6f63] ${
                         selected ? "border-[#2f6f63] bg-[#eef7f3]" : "border-[#d9d3c7] bg-white"
                       }`}
-                      onClick={() => chooseDecision(card.type, card.available)}
+                      onClick={() => chooseDecision(card.type)}
                       type="button"
                     >
                       <span>
                         <span className="block text-xl font-semibold text-[#28322f]">{card.title}</span>
                         <span className="mt-3 block text-sm leading-relaxed text-[#6d766f]">{card.examples}</span>
                       </span>
-                      <span className={`mt-5 w-fit rounded-full border px-3 py-1 text-sm font-semibold ${card.available ? "border-[#2f6f63] text-[#2f6f63]" : "border-[#d9d3c7] text-[#6d766f]"}`}>
-                        {card.available ? "Analizar" : "Próximamente"}
+                      <span className="mt-5 w-fit rounded-full border border-[#2f6f63] px-3 py-1 text-sm font-semibold text-[#2f6f63]">
+                        Analizar
                       </span>
                     </button>
                   );
                 })}
               </div>
-              {showComingSoon ? (
-                <div className="rounded-lg border border-[#d9d3c7] bg-white p-4 text-sm leading-relaxed text-[#6d766f]">
-                  Esta capa narrativa todavía no está disponible. Podés avanzar con inversión / oportunidad o compra personal.
-                </div>
-              ) : null}
             </div>
           ) : null}
 
@@ -503,7 +566,6 @@ export function Simulator() {
                 <NumberField label="Gastos mensuales actuales, incluyendo cuotas y deudas" value={inputs.expenses} onChange={(value) => update("expenses", value)} />
                 <NumberField label="Caja / ahorros disponibles" value={inputs.cash} onChange={(value) => update("cash", value)} />
                 <SelectField<Currency> label="Moneda de análisis" value={inputs.currency} options={["ARS", "USD"]} onChange={(value) => update("currency", value)} />
-                <NumberField label="Plazo de simulación" value={inputs.months} min={2} onChange={(value) => update("months", Math.min(24, Math.max(2, Math.round(value || 2))))} helper="Elegí entre 2 y 24 meses." />
               </div>
             </div>
           ) : null}
@@ -512,7 +574,7 @@ export function Simulator() {
             <div className="grid gap-6">
               <div>
                 <h2 className="text-2xl font-semibold text-[#28322f]">
-                  {isInvestment ? "Inversión / oportunidad" : "Nueva decisión"}
+                  {isInvestment ? "Inversión / crecimiento" : "Nueva decisión"}
                 </h2>
                 <p className="mt-2 text-sm text-[#6d766f]">
                   {isInvestment
@@ -526,17 +588,20 @@ export function Simulator() {
                     <NumberField label="Capital inicial a invertir" value={inputs.investment} onChange={(value) => update("investment", value)} helper="Monto que necesitás poner al comienzo." />
                     <NumberField label="Costos mensuales de sostener la inversión" value={inputs.newExpense} onChange={(value) => update("newExpense", value)} helper="Expensas, mantenimiento, seguros, gastos administrativos u otros costos." />
                     <NumberField label="Ingreso mensual esperado" value={inputs.newIncome} onChange={(value) => update("newIncome", value)} helper="Completá solo si la inversión genera ingresos durante el período." />
-                    <NumberField label="Mes desde el que empieza a generar ingresos" value={inputs.incomeStartMonth} min={1} onChange={(value) => update("incomeStartMonth", clampMonth(value, inputs.months))} />
                     <NumberField label="Valor estimado de venta o salida" value={inputs.exitValue} onChange={(value) => update("exitValue", value)} helper="Monto que estimás recibir si vendés o cerrás la inversión." />
-                    <NumberField label="Mes estimado de venta o salida" value={inputs.exitMonth} min={1} onChange={(value) => update("exitMonth", clampMonth(value, inputs.months))} helper="Mes en el que esperás recuperar el capital o vender el activo." />
+                    <NumberField label="Mes estimado de venta o salida" value={inputs.exitMonth} min={1} onChange={(value) => update("exitMonth", clampMonth(value))} helper="Mes en el que esperás recuperar el capital o vender el activo." />
                   </>
                 ) : (
                   <>
-                    <NumberField label="Inversión inicial" value={inputs.investment} onChange={(value) => update("investment", value)} />
-                    <NumberField label="Nuevo gasto mensual" value={inputs.newExpense} onChange={(value) => update("newExpense", value)} />
-                    <NumberField label="Nuevos ingresos esperados" value={inputs.newIncome} onChange={(value) => update("newIncome", value)} />
-                    <NumberField label="Mes desde el que impactan los nuevos ingresos" value={inputs.incomeStartMonth} min={1} onChange={(value) => update("incomeStartMonth", clampMonth(value, inputs.months))} />
-                    <NumberField label="Mes desde el que impactan los nuevos gastos" value={inputs.expenseStartMonth} min={1} onChange={(value) => update("expenseStartMonth", clampMonth(value, inputs.months))} />
+                    <NumberField label="Monto inicial necesario" value={inputs.investment} onChange={(value) => update("investment", value)} helper="Monto que necesitás poner al comienzo." />
+                    <ToggleField label="¿Esta decisión podría generar ingresos?" value={inputs.hasNewIncome} onChange={(value) => update("hasNewIncome", value)} />
+                    {inputs.hasNewIncome ? (
+                      <NumberField label="Nuevos ingresos esperados" value={inputs.newIncome} onChange={(value) => update("newIncome", value)} helper="Completalo solo si esta decisión podría generar ingresos." />
+                    ) : null}
+                    <ToggleField label="¿Esta decisión genera nuevos gastos?" value={inputs.hasNewExpense} onChange={(value) => update("hasNewExpense", value)} />
+                    {inputs.hasNewExpense ? (
+                      <NumberField label="Nuevos gastos esperados" value={inputs.newExpense} onChange={(value) => update("newExpense", value)} helper="Patente, seguro, mantenimiento, expensas u otros gastos nuevos." />
+                    ) : null}
                   </>
                 )}
               </div>
@@ -550,20 +615,32 @@ export function Simulator() {
                 <p className="mt-2 text-sm text-[#6d766f]">
                   {isInvestment
                     ? "No calculamos una tasa bancaria exacta. Estimamos el costo financiero aproximado para ayudarte a decidir."
-                    : "Usá el monto de cuota que te ofrecen. No calculamos tasas bancarias."}
+                    : "Elegí cómo pagarías esta decisión para estimar su impacto real en tu caja."}
                 </p>
               </div>
               <div className="grid gap-4 md:grid-cols-2">
-                <SelectField<PaymentType> label="Forma de pago" value={inputs.paymentType} options={["Contado", "Cuotas"]} onChange={(value) => update("paymentType", value)} />
-                <NumberField label="Monto financiado" value={inputs.financedAmount} onChange={(value) => update("financedAmount", value)} />
-                <NumberField label="Cantidad de cuotas" value={inputs.installments} min={1} onChange={(value) => update("installments", clampMonth(value, inputs.months))} />
-                <NumberField label="Cuota mensual ofrecida" value={inputs.offeredInstallment} onChange={(value) => update("offeredInstallment", value)} />
+                <SelectField<PaymentType>
+                  label="¿Cómo pagarías esta decisión?"
+                  value={inputs.paymentType}
+                  options={["100% contado", "Parte contado + parte financiado", "100% financiado"]}
+                  onChange={(value) => update("paymentType", value)}
+                />
+                {inputs.paymentType === "Parte contado + parte financiado" ? (
+                  <NumberField label="Pago inicial" value={inputs.downPayment} onChange={(value) => update("downPayment", value)} />
+                ) : null}
+                {hasFinancing ? (
+                  <>
+                    <NumberField label="Monto financiado" value={inputs.financedAmount} onChange={(value) => update("financedAmount", value)} />
+                    <NumberField label="Cantidad de cuotas" value={inputs.installments} min={1} onChange={(value) => update("installments", clampMonth(value))} />
+                    <NumberField label="Cuota mensual ofrecida" value={inputs.offeredInstallment} onChange={(value) => update("offeredInstallment", value)} />
+                  </>
+                ) : null}
               </div>
-              <div className="grid gap-4 md:grid-cols-3">
-                <MetricCard label="Total financiado" value={money(totalFinanced, inputs.currency)} />
-                <MetricCard label="Total pagado" value={money(totalPaid, inputs.currency)} />
-                <MetricCard label="Costo financiero estimado" value={`${money(financeCost, inputs.currency)} (${(financeCostPct * 100).toFixed(1)}%)`} helper="No reemplaza el CFT informado por el proveedor o entidad financiera." />
-              </div>
+              {hasFinancing ? (
+                <FinanceSummary results={results} currency={inputs.currency} />
+              ) : (
+                <MetricCard label="Pago contado" value={money(results.upfrontPaid, inputs.currency)} helper="No hay cuotas ni costo financiero estimado." />
+              )}
             </div>
           ) : null}
 
@@ -574,54 +651,67 @@ export function Simulator() {
                 <p className="mt-2 text-sm text-[#6d766f]">
                   {isInvestment
                     ? "Esta simulación no recomienda inversiones. Solo muestra el impacto estimado en tu caja según los datos cargados."
-                    : "Mirá por separado si la decisión recupera lo invertido y si podés sostenerla."}
+                    : "Mirá cómo esta decisión impactaría tu caja y tu capacidad de sostenerla."}
                 </p>
               </div>
 
-              <section className="grid gap-4 lg:grid-cols-3">
-                <MetricCard label={isInvestment ? "Capital invertido" : "Inversión analizada"} value={money(inputs.investment, inputs.currency)} helper={isInvestment ? "Capital inicial cargado para la oportunidad." : "Monto inicial que necesitás recuperar."} />
-                <MetricCard label={isInvestment ? "Flujo mensual de la inversión" : "Flujo mensual nuevo"} value={money(results.monthlyFlow, inputs.currency)} helper={isInvestment ? "Ingreso esperado menos costos mensuales y cuota, si corresponde." : "Resultado mensual generado únicamente por esta nueva decisión."} tone={results.monthlyFlow >= 0 ? "success" : "danger"} />
-                <MetricCard label="Recupero estimado" value={results.recoveryMonths ? `Mes ${results.recoveryMonths}` : "No recupera"} helper={isInvestment ? "Mes estimado de recupero o salida cargado en la simulación." : "Tiempo estimado en el que la nueva decisión recuperaría lo invertido."} tone={results.recoveryMonths ? "success" : "danger"} />
-              </section>
+              {isPurchase ? (
+                <>
+                  <section className="grid gap-4">
+                    <h3 className="text-xl font-semibold text-[#28322f]">Impacto sobre tu situación actual</h3>
+                    <div className="grid gap-4 lg:grid-cols-3">
+                      <MetricCard label="Estado" value={results.status} tone={results.status === "Sostenible" ? "success" : results.status === "Ajustada" ? "warning" : "danger"} helper="Situación actual + decisión simulada." />
+                      <MetricCard label="Caja final estimada" value={money(results.finalCash, inputs.currency)} />
+                      <MetricCard label="Caja mínima" value={money(results.minCash, inputs.currency)} helper={`Mes más exigente: ${results.mostDemandingMonth}.`} />
+                    </div>
+                  </section>
 
-              {isInvestment ? (
-                <section className="grid gap-4">
-                  <h3 className="text-xl font-semibold text-[#28322f]">Resultado de la inversión</h3>
-                  <div className="grid gap-4 lg:grid-cols-4">
-                    <MetricCard label="Capital invertido" value={money(results.capitalPaid, inputs.currency)} />
-                    <MetricCard label="Valor estimado de salida" value={money(results.exitValue, inputs.currency)} />
-                    <MetricCard label="Resultado estimado" value={money(results.investmentResult, inputs.currency)} tone={results.investmentResult >= 0 ? "success" : "danger"} />
-                    <MetricCard label="Recupero estimado" value={results.recoveryMonths ? `Mes ${results.recoveryMonths}` : "No recupera"} />
-                  </div>
-                </section>
-              ) : null}
+                  <section className="grid gap-4">
+                    <h3 className="text-xl font-semibold text-[#28322f]">Resultado de la decisión</h3>
+                    <div className="grid gap-4 lg:grid-cols-4">
+                      <MetricCard label="Pago inicial" value={money(results.upfrontPaid, inputs.currency)} compact />
+                      {hasFinancing ? <MetricCard label="Cuota mensual" value={money(inputs.offeredInstallment, inputs.currency)} compact /> : null}
+                      <MetricCard label="Nuevos gastos mensuales" value={money(inputs.hasNewExpense ? inputs.newExpense : 0, inputs.currency)} compact />
+                      {hasFinancing ? <MetricCard label="Costo financiero estimado" value={money(results.financeCost, inputs.currency)} helper={`${(results.financeCostPct * 100).toFixed(1)}% sobre lo financiado.`} compact /> : null}
+                    </div>
+                  </section>
+                </>
+              ) : (
+                <>
+                  <section className="grid gap-4 lg:grid-cols-3">
+                    <MetricCard label="Capital invertido" value={money(inputs.investment, inputs.currency)} helper="Capital inicial cargado para la oportunidad." />
+                    <MetricCard label="Flujo mensual de la inversión" value={money(results.monthlyFlow, inputs.currency)} helper="Ingreso esperado menos costos mensuales y cuota, si corresponde." tone={results.monthlyFlow >= 0 ? "success" : "danger"} />
+                    <MetricCard label="Recupero estimado" value={results.recoveryMonths ? `Mes ${results.recoveryMonths}` : "No recupera"} helper="Mes estimado de recupero o salida cargado en la simulación." tone={results.recoveryMonths ? "success" : "danger"} />
+                  </section>
 
-              <section className="grid gap-4">
-                <div>
-                  <h3 className="text-xl font-semibold text-[#28322f]">
-                    {isInvestment ? "Impacto en tu situación actual" : "Impacto en tu caja"}
-                  </h3>
-                  {isInvestment ? (
-                    <p className="mt-1 text-sm text-[#6d766f]">
-                      ¿Podés sostener esta inversión sin comprometer tu estabilidad financiera?
-                    </p>
-                  ) : null}
-                </div>
-                <div className="grid gap-4 lg:grid-cols-4">
-                  <MetricCard label="Caja final" value={money(results.finalCash, inputs.currency)} />
-                  <MetricCard label={isInvestment ? "Mes más exigente" : "Resultado total"} value={isInvestment ? `Mes ${results.mostDemandingMonth}` : money(results.totalResult, inputs.currency)} />
-                  <MetricCard label="Caja mínima" value={money(results.minCash, inputs.currency)} />
-                  <MetricCard label="Estado" value={results.status} tone={results.status === "Sostenible" ? "success" : results.status === "Ajustada" ? "warning" : "danger"} helper={isInvestment ? "Situación actual + inversión." : "Situación actual + nueva decisión."} />
-                </div>
-              </section>
+                  <section className="grid gap-4">
+                    <h3 className="text-xl font-semibold text-[#28322f]">Resultado de la inversión</h3>
+                    <div className="grid gap-4 lg:grid-cols-4">
+                      <MetricCard label="Capital invertido" value={money(results.upfrontPaid + results.totalPaid, inputs.currency)} />
+                      <MetricCard label="Valor estimado de salida" value={money(results.exitValue, inputs.currency)} />
+                      <MetricCard label="Resultado estimado" value={money(results.investmentResult, inputs.currency)} tone={results.investmentResult >= 0 ? "success" : "danger"} />
+                      <MetricCard label="Recupero estimado" value={results.recoveryMonths ? `Mes ${results.recoveryMonths}` : "No recupera"} />
+                    </div>
+                  </section>
 
-              <section className="grid gap-4 lg:grid-cols-3">
-                <MetricCard label="Total financiado" value={money(totalFinanced, inputs.currency)} />
-                <MetricCard label="Total pagado" value={money(totalPaid, inputs.currency)} />
-                <MetricCard label="Costo financiero estimado" value={`${money(financeCost, inputs.currency)} (${(financeCostPct * 100).toFixed(1)}%)`} />
-              </section>
+                  <section className="grid gap-4">
+                    <div>
+                      <h3 className="text-xl font-semibold text-[#28322f]">Impacto en tu situación actual</h3>
+                      <p className="mt-1 text-sm text-[#6d766f]">
+                        ¿Podés sostener esta inversión sin comprometer tu estabilidad financiera?
+                      </p>
+                    </div>
+                    <div className="grid gap-4 lg:grid-cols-4">
+                      <MetricCard label="Caja final" value={money(results.finalCash, inputs.currency)} />
+                      <MetricCard label="Mes más exigente" value={`Mes ${results.mostDemandingMonth}`} />
+                      <MetricCard label="Caja mínima" value={money(results.minCash, inputs.currency)} />
+                      <MetricCard label="Estado" value={results.status} tone={results.status === "Sostenible" ? "success" : results.status === "Ajustada" ? "warning" : "danger"} helper="Situación actual + inversión." />
+                    </div>
+                  </section>
+                </>
+              )}
 
-              <CashChart rows={results.rows} currency={inputs.currency} />
+              {hasFinancing ? <FinanceSummary results={results} currency={inputs.currency} /> : null}
 
               <section className="grid gap-3">
                 <h3 className="text-xl font-semibold text-[#28322f]">¿Qué pasa si las cosas cambian?</h3>
@@ -650,7 +740,7 @@ export function Simulator() {
                       </div>
                       <div className="grid grid-cols-2 gap-3 text-sm">
                         <span>Caja final</span><strong>{money(scenario.result.finalCash, inputs.currency)}</strong>
-                        <span>Resultado estimado</span><strong>{money(isInvestment ? scenario.result.investmentResult : scenario.result.totalResult, inputs.currency)}</strong>
+                        <span>{isInvestment ? "Resultado estimado" : "Impacto estimado"}</span><strong>{money(isInvestment ? scenario.result.investmentResult : scenario.result.totalResult, inputs.currency)}</strong>
                         <span>Caja mínima</span><strong>{money(scenario.result.minCash, inputs.currency)}</strong>
                         <span>Estado</span><strong>{scenario.result.status}</strong>
                       </div>
@@ -674,12 +764,14 @@ export function Simulator() {
                   </div>
                 )}
                 <div className="grid gap-3 md:grid-cols-4">
-                  <MetricCard label="Caja final" value={money(custom.finalCash, inputs.currency)} />
-                  <MetricCard label="Resultado estimado" value={money(isInvestment ? custom.investmentResult : custom.totalResult, inputs.currency)} />
-                  <MetricCard label="Caja mínima" value={money(custom.minCash, inputs.currency)} />
-                  <MetricCard label="Estado" value={custom.status} tone={custom.status === "Sostenible" ? "success" : custom.status === "Ajustada" ? "warning" : "danger"} />
+                  <MetricCard label="Caja final" value={money(custom.finalCash, inputs.currency)} compact />
+                  <MetricCard label={isInvestment ? "Resultado estimado" : "Impacto estimado"} value={money(isInvestment ? custom.investmentResult : custom.totalResult, inputs.currency)} compact />
+                  <MetricCard label="Caja mínima" value={money(custom.minCash, inputs.currency)} compact />
+                  <MetricCard label="Estado" value={custom.status} tone={custom.status === "Sostenible" ? "success" : custom.status === "Ajustada" ? "warning" : "danger"} compact />
                 </div>
               </section>
+
+              <CashChart rows={results.rows} currency={inputs.currency} compact={isPurchase} />
             </div>
           ) : null}
         </section>

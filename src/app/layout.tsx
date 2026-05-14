@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Simulador de Impacto de una Inversión",
+  title: "Simulador de Decisiones Financieras",
   description: "Evaluá el impacto estimado de una decisión financiera en tu caja."
 };
 

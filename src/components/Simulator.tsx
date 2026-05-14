@@ -597,7 +597,12 @@ export function Simulator() {
               <div className="grid gap-4 md:grid-cols-2">
                 <NumberField label="Ingresos mensuales actuales" value={inputs.income} onChange={(value) => update("income", value)} />
                 <NumberField label="Gastos mensuales actuales, incluyendo cuotas y deudas" value={inputs.expenses} onChange={(value) => update("expenses", value)} />
-                <NumberField label="Caja / ahorros disponibles" value={inputs.cash} onChange={(value) => update("cash", value)} />
+                <NumberField
+                  label="Caja o ahorros disponibles hoy"
+                  value={inputs.cash}
+                  onChange={(value) => update("cash", value)}
+                  helper="Dinero disponible antes de tomar esta decisión."
+                />
                 <SelectField<Currency> label="Moneda de análisis" value={inputs.currency} options={["ARS", "USD"]} onChange={(value) => update("currency", value)} />
               </div>
             </div>
@@ -699,10 +704,23 @@ export function Simulator() {
                 <>
                   <section className="grid gap-4">
                     <h3 className="text-xl font-semibold text-[#28322f]">Impacto sobre tu situación actual</h3>
-                    <div className="grid gap-4 lg:grid-cols-3">
+                    <div className="grid gap-4 lg:grid-cols-4">
                       <MetricCard label="Estado" value={results.status} tone={results.status === "Sostenible" ? "success" : results.status === "Ajustada" ? "warning" : "danger"} helper="Situación actual + decisión simulada." />
-                      <MetricCard label="Caja final estimada" value={money(results.finalCash, inputs.currency)} />
-                      <MetricCard label="Caja mínima" value={money(results.minCash, inputs.currency)} helper={`Mes más exigente: ${results.mostDemandingMonth}.`} />
+                      <MetricCard
+                        label="Caja estimada al final del período analizado"
+                        value={money(results.finalCash, inputs.currency)}
+                        helper="Dinero estimado al finalizar la simulación."
+                      />
+                      <MetricCard
+                        label="Caja mínima"
+                        value={money(results.minCash, inputs.currency)}
+                        helper="Nivel más bajo de dinero disponible durante la simulación."
+                      />
+                      <MetricCard
+                        label="Mes más exigente"
+                        value={`Mes ${results.mostDemandingMonth}`}
+                        helper="Mes en el que tu caja llega a su punto más bajo."
+                      />
                     </div>
                   </section>
 

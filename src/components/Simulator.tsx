@@ -50,6 +50,7 @@ type Calculation = {
   minCash: number;
   monthlyFlow: number;
   recoveryMonths: number | null;
+  exitMonth: number;
   mostDemandingMonth: number;
   upfrontPaid: number;
   totalFinanced: number;
@@ -126,11 +127,12 @@ function clampMonth(value: number, max = 120) {
   return Math.min(max, Math.max(1, Math.round(value || 1)));
 }
 
-function getSimulationMonths(inputs: Inputs, isInvestment: boolean) {
+function getSimulationMonths(inputs: Inputs, isInvestment: boolean, scenario: Scenario = {}) {
   const selectedMonths = Math.min(24, Math.max(2, Math.round(inputs.analysisMonths || 12)));
   const financingMonths = inputs.paymentType === "100% contado" ? 0 : inputs.installments;
   if (isInvestment) {
-    return Math.max(selectedMonths, inputs.exitMonth, financingMonths);
+    const scenarioExitMonth = Math.max(1, inputs.exitMonth + (scenario.exitMonthDelta ?? 0));
+    return Math.max(selectedMonths, scenarioExitMonth, financingMonths);
   }
   return Math.max(selectedMonths, financingMonths);
 }
@@ -176,7 +178,7 @@ function statusClasses(status: Status) {
 function buildProjection(inputs: Inputs, scenario: Scenario = {}, isInvestment = false): MonthRow[] {
   const rows: MonthRow[] = [];
   let cash = inputs.cash;
-  const months = getSimulationMonths(inputs, isInvestment);
+  const months = getSimulationMonths(inputs, isInvestment, scenario);
   const payment = getPaymentSummary(inputs);
   const adjustedExpense = (isInvestment || inputs.hasNewExpense)
     ? Math.max(0, inputs.newExpense * (1 + (scenario.costPct ?? 0)) + (scenario.expenseChange ?? 0))
@@ -236,19 +238,21 @@ function calculate(inputs: Inputs, scenario: Scenario = {}, isInvestment = false
     : 0;
   const monthlyFlow = adjustedIncome - adjustedExpense - (payment.hasFinancing ? inputs.offeredInstallment : 0);
   const adjustedExitValue = Math.max(0, inputs.exitValue * (1 + (scenario.exitValuePct ?? 0)));
+  const adjustedExitMonth = clampMonth(inputs.exitMonth + (scenario.exitMonthDelta ?? 0), getSimulationMonths(inputs, isInvestment, scenario));
   const generatedIncome = rows.reduce((acc, row) => acc + row.newIncome, 0);
   const carryingCosts = rows.reduce((acc, row) => acc + row.newExpenses, 0);
+  const exitIncome = rows.reduce((acc, row) => acc + row.exitIncome, 0);
   const financingPaid = rows.reduce((acc, row) => acc + row.financingPayment, 0);
   const upfrontPaid = rows.reduce((acc, row) => acc + row.upfrontPayment, 0);
   const incrementalResult =
     rows.reduce((acc, row) => acc + row.newIncome - row.newExpenses - row.financingPayment, 0) -
     upfrontPaid;
   const investmentResult = isInvestment
-    ? generatedIncome + adjustedExitValue - carryingCosts - upfrontPaid - financingPaid
+    ? generatedIncome + exitIncome - carryingCosts - upfrontPaid - financingPaid
     : incrementalResult;
   const recoveryMonths = isInvestment
-    ? investmentResult >= 0
-      ? clampMonth(inputs.exitMonth + (scenario.exitMonthDelta ?? 0), getSimulationMonths(inputs, isInvestment))
+    ? adjustedIncome - adjustedExpense > 0
+      ? Math.ceil(inputs.investment / (adjustedIncome - adjustedExpense))
       : null
     : monthlyFlow > 0
       ? Math.ceil(upfrontPaid / monthlyFlow)
@@ -265,6 +269,7 @@ function calculate(inputs: Inputs, scenario: Scenario = {}, isInvestment = false
     minCash,
     monthlyFlow,
     recoveryMonths,
+    exitMonth: adjustedExitMonth,
     mostDemandingMonth,
     upfrontPaid,
     totalFinanced: payment.totalFinanced,
@@ -483,7 +488,7 @@ export function Simulator() {
 
   const results = useMemo(() => calculate(inputs, {}, isInvestment), [inputs, isInvestment]);
   const difficult = useMemo(
-    () => calculate(inputs, isInvestment ? { exitValuePct: -0.2, costPct: 0.1, exitMonthDelta: inputs.exitMonth + 2 <= getSimulationMonths(inputs, true) ? 2 : 0 } : { incomeChange: inputs.newIncome * -0.2, expenseChange: inputs.newExpense * 0.1 }, isInvestment),
+    () => calculate(inputs, isInvestment ? { exitValuePct: -0.2, costPct: 0.1, exitMonthDelta: 2 } : { incomeChange: inputs.newIncome * -0.2, expenseChange: inputs.newExpense * 0.1 }, isInvestment),
     [inputs, isInvestment]
   );
   const favorable = useMemo(
@@ -756,17 +761,17 @@ export function Simulator() {
                 <>
                   <section className="grid gap-4 lg:grid-cols-3">
                     <MetricCard label="Capital invertido" value={money(inputs.investment, inputs.currency)} helper="Capital inicial cargado para la oportunidad." />
-                    <MetricCard label="Flujo mensual de la inversión" value={money(results.monthlyFlow, inputs.currency)} helper="Ingreso esperado menos costos mensuales y cuota, si corresponde." tone={results.monthlyFlow >= 0 ? "success" : "danger"} />
-                    <MetricCard label="Recupero estimado" value={results.recoveryMonths ? `Mes ${results.recoveryMonths}` : "No recupera"} helper="Mes estimado de recupero o salida cargado en la simulación." tone={results.recoveryMonths ? "success" : "danger"} />
+                    <MetricCard label="Flujo mensual de la inversión" value={money(inputs.newIncome - inputs.newExpense, inputs.currency)} helper="Ingreso mensual esperado menos costos mensuales de sostener la inversión." tone={inputs.newIncome - inputs.newExpense >= 0 ? "success" : "danger"} />
+                    <MetricCard label="Recupero por flujo" value={results.recoveryMonths ? `Mes ${results.recoveryMonths}` : "No recupera"} helper="Calculado con el flujo mensual de la inversión, sin confundirlo con la venta o salida." tone={results.recoveryMonths ? "success" : "danger"} />
                   </section>
 
                   <section className="grid gap-4">
                     <h3 className="text-xl font-semibold text-[#28322f]">Resultado de la inversión</h3>
                     <div className="grid gap-4 lg:grid-cols-4">
-                      <MetricCard label="Capital invertido" value={money(results.upfrontPaid + results.totalPaid, inputs.currency)} />
+                      <MetricCard label="Capital invertido" value={money(inputs.investment, inputs.currency)} />
                       <MetricCard label="Valor estimado de salida" value={money(results.exitValue, inputs.currency)} />
+                      <MetricCard label="Salida estimada" value={`Mes ${results.exitMonth}`} helper="Mes en el que estimás vender o cerrar la inversión." />
                       <MetricCard label="Resultado estimado" value={money(results.investmentResult, inputs.currency)} tone={results.investmentResult >= 0 ? "success" : "danger"} />
-                      <MetricCard label="Recupero estimado" value={results.recoveryMonths ? `Mes ${results.recoveryMonths}` : "No recupera"} />
                     </div>
                   </section>
 
